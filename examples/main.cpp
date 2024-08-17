@@ -71,12 +71,11 @@ int main() {
         {
             auto next_execution_time = std::chrono::steady_clock::now() + std::chrono::milliseconds{50};
 
+            // Check if we can start any tasks
             ranges::for_each(mainteriner.tasks_, [](auto const& task) {
                 spdlog::info("name {}", task.name_);
                 std::this_thread::sleep_for(std::chrono::microseconds{50});
             });
-
-            // Check if we can start any tasks
 
             // if we can start a task launch it ("fire the missles" - ltesta)
             task meets_requirements{};
@@ -87,16 +86,16 @@ int main() {
         }
     };
 
-    auto poller = ex::just(task_mainteriner{}) | ex::then(polling_work);
+    auto poller =
+        ex::just(task_mainteriner{})
+        | ex::then(polling_work);
 
     // execute the whole flow asynchronously
     ex::start_detached(std::move(poller));
 
-
     auto work_manager = [/* zmq */]{
-        exec::static_thread_pool work_pool{32};
-        ex::scheduler auto work_sched = work_pool.get_scheduler();
-
+        auto work_pool      = exec::static_thread_pool{32};
+        auto work_scheduler = work_pool.get_scheduler();
 
 
 
