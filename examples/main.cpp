@@ -35,198 +35,81 @@
 
 #include <iostream>
 #include <array>
-#include <string_view>
+#include <chrono>
 #include <cstring>
 #include <mutex>
 
 // Pull in the reference implementation of P2300:
 #include <range/v3/all.hpp>
 #include <spdlog/spdlog.h>
+#include <fmt/ranges.h>
 #include <stdexec/execution.hpp>
 #include <exec/async_scope.hpp>
+#include <range/v3/all.hpp>
 // Use a thread pool
 #include "exec/static_thread_pool.hpp"
 
-
-
-#include <iomanip>
-#include <iostream>
-#include <string>
-
-namespace vz {
-    struct Counters {
-        unsigned m_def_ctor    = 0;
-        unsigned m_copy_ctor   = 0;
-        unsigned m_move_ctor   = 0;
-        unsigned m_copy_assign = 0;
-        unsigned m_move_assign = 0;
-        unsigned m_dtor        = 0;
-
-        void reset() {
-            *this = {};
-        }
-
-        bool leaks() const {
-            return m_def_ctor + m_copy_ctor + m_move_ctor != m_dtor;
-        }
-
-        auto numbers() const {
-            return std::format(
-                "Default constructor count: {:2}\nCopy constructor count:    {:2}\nMove constructor count:    {:2}\nCopy assignment count:     {:2}\nMove assignment count:     {:2}\nDestructor count:          {:2}",
-                 m_def_ctor   ,
-                 m_copy_ctor  ,
-                 m_move_ctor  ,
-                 m_copy_assign,
-                 m_move_assign,
-                 m_dtor
-            );
-        }
-
-        friend bool operator==(const Counters& lhs, const Counters& rhs) {
-            return
-                lhs.m_def_ctor    == rhs.m_def_ctor    &&
-                lhs.m_copy_ctor   == rhs.m_copy_ctor   &&
-                lhs.m_move_ctor   == rhs.m_move_ctor   &&
-                lhs.m_copy_assign == rhs.m_copy_assign &&
-                lhs.m_move_assign == rhs.m_move_assign &&
-                lhs.m_dtor        == rhs.m_dtor        ;
-        }
-
-        friend bool operator!=(const Counters& lhs, const Counters& rhs) { return !(lhs == rhs); }
-
-    };
-}
-
-template <> struct fmt::formatter<vz::Counters>: formatter<std::string> {
-    // parse is inherited from formatter<string_view>.
-    auto format(vz::Counters const& c, format_context& ctx) const -> format_context::iterator {
-        return formatter<std::string>::format(c.numbers(), ctx);
-    }
-};
-
-namespace vz::detail {
-
-struct Globals {
-    ~Globals() {
-        if (m_verbose)
-           spdlog::info("\n===== Noisy counters =====\n{}", m_counters);
-    }
-
-    Counters m_counters;
-    unsigned m_next_id = 0;
-    bool     m_verbose = true;
-};
-
-}
-
-namespace  vz {
-class Noisy {
-private:
-    static detail::Globals& globals() {
-        static detail::Globals s_globals;
-        return s_globals;
-    }
-
-public:
-    static Counters& counters() { return globals().m_counters; }
-    static void set_verbose(bool verbose) { globals().m_verbose = verbose; }
-
-    Noisy() {
-        if (globals().m_verbose)
-            spdlog::info("{}: default constructor ", this->id());
-        globals().m_counters.m_def_ctor++;
-    }
-
-    ~Noisy() {
-        if (globals().m_verbose)
-            spdlog::info("{}: destructor ", this->id());
-        globals().m_counters.m_dtor++;
-    }
-
-    Noisy(const Noisy& other) {
-        if (globals().m_verbose)
-            spdlog::info("{}: copy constructor from {} ", this->id(), other.id());
-        globals().m_counters.m_copy_ctor++;
-    }
-
-    Noisy(Noisy&& other) noexcept {
-        if (globals().m_verbose)
-            spdlog::info("{}: move constructor from {} ", this->id(), other.id());
-        globals().m_counters.m_move_ctor++;
-    }
-
-
-    Noisy& operator=(const Noisy& other) {
-        if (globals().m_verbose)
-            spdlog::info("{}: copy assignment from {} ", this->id(), other.id());
-        globals().m_counters.m_copy_assign++;
-        return *this;
-    }
-
-    Noisy& operator=(Noisy&& other) noexcept {
-        if (globals().m_verbose)
-            spdlog::info("{}: move assignment from {} ", this->id(), other.id());
-        globals().m_counters.m_move_assign++;
-        return *this;
-    }
-
-    [[nodiscard]] unsigned id() const { return m_id; }
-
-private:
-    unsigned m_id = globals().m_next_id++;
-};
-
-}
-
-
 namespace ex = stdexec;
+struct task {
+    std::string name_;
+    void run(task const&){}
+    void error(std::exception_ptr err){  std::rethrow_exception(err); }
+    void stopped(){}
+    void write_to_file(){}
+};
 
-auto ingest(std::unique_ptr<vz::Noisy> buffer) {
-    return buffer;
-}
+struct task_mainteriner {
+    std::vector<task> tasks_;
 
-auto process_read_data(auto read_data) {
-    spdlog::info("Processing Noisy({})", read_data->id());
-    return read_data;
-}
+};
 
 int main() {
-    // Create a thread pool and get a scheduler from it
-    exec::static_thread_pool work_pool{8};
-    ex::scheduler auto work_sched = work_pool.get_scheduler();
 
-    exec::static_thread_pool io_pool{1};
-    ex::scheduler auto io_sched = io_pool.get_scheduler();
-    vz::Noisy::set_verbose(false);
-    try {
-        exec::async_scope scope;
-        // Fake a couple of requests
-        for (int i = 0; i < 1; i++) {
+    auto polling_work = [finished = false /* zmq */] (task_mainteriner&& mainteriner) mutable -> void
+    {
+        while (not finished)
+        {
+            auto next_execution_time = std::chrono::steady_clock::now() + std::chrono::milliseconds{50};
 
-            // The entire flow
-            auto snd =
-                // start by reading data on the I/O thread
-                ex::on(io_sched, ex::just(std::make_unique<vz::Noisy>()) | ex::then(ingest))
-                // do the processing on the worker threads pool
-                | ex::transfer(work_sched)
-                // process the incoming data (on worker threads)
-                | ex::then([](auto&& buffers) {
-                    using type = std::remove_cvref_t<decltype(buffers)>;
-                    process_read_data(std::forward<type>(buffers));
-                })
-                // done
-                ;
+            ranges::for_each(mainteriner.tasks_, [](auto const& task) {
+                spdlog::info("name {}", task.name_);
+                std::this_thread::sleep_for(std::chrono::microseconds{50});
+            });
 
-            // execute the whole flow asynchronously
-            scope.spawn(std::move(snd));
+            // Check if we can start any tasks
+
+            // if we can start a task launch it ("fire the missles" - ltesta)
+            task meets_requirements{};
+            ex::sender auto task_work = ex::just(task{meets_requirements}) | ex::then([](task&& t){t.run(t);});
+
+            // zmq.send(task_work)
+            std::this_thread::sleep_until(next_execution_time);
         }
-        (void) stdexec::sync_wait(scope.on_empty());
-        spdlog::info("\n===== list =====\n{}",vz::Noisy::counters());
-        return 0;
+    };
 
-    }
-    catch (std::exception const& e) {
-        spdlog::error("{}",e.what());
-    }
+    auto poller = ex::just(task_mainteriner{}) | ex::then(polling_work);
+
+    // execute the whole flow asynchronously
+    ex::start_detached(std::move(poller));
+
+
+    auto work_manager = [/* zmq */]{
+        exec::static_thread_pool work_pool{32};
+        ex::scheduler auto work_sched = work_pool.get_scheduler();
+
+
+
+
+    };
+
+
+    // exec::async_scope scope;
+    //
+    //
+    //
+    //
+    // scope.spawn(std::move(snd));
+    //
+    // (void) stdexec::sync_wait(scope.on_empty());
     return 0;
 }
