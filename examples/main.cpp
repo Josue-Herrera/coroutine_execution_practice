@@ -36,8 +36,8 @@
 #include <iostream>
 #include <array>
 #include <chrono>
-#include <cstring>
 #include <mutex>
+#include <queue>
 
 // Pull in the reference implementation of P2300:
 #include <range/v3/all.hpp>
@@ -48,10 +48,12 @@
 #include <range/v3/all.hpp>
 // Use a thread pool
 #include "exec/static_thread_pool.hpp"
+#include "spdlog/sinks/basic_file_sink.h"
 
 namespace ex = stdexec;
 struct task {
     std::string name_;
+    int i;
     void run(task const&){}
     void error(std::exception_ptr err){  std::rethrow_exception(err); }
     void stopped(){}
@@ -60,55 +62,100 @@ struct task {
 
 struct task_mainteriner {
     std::vector<task> tasks_;
-
 };
 
-int main() {
-
-    auto polling_work = [finished = false /* zmq */] (task_mainteriner&& mainteriner) mutable -> void
+template <class T> struct blocking_queue
+{
+    constexpr void enqueue(T&& t) noexcept
     {
+        std::lock_guard<std::mutex> lock(m);
+        q.push(std::forward<T>(t));
+        c.notify_one();
+    }
+
+    [[nodiscard]] constexpr T dequeue() noexcept
+    {
+        std::unique_lock<std::mutex> lock(m);
+        while(q.empty()) { c.wait(lock); }
+        T val = std::move(q.front());
+        q.pop();
+        return val;
+    }
+
+private:
+    std::queue<T> q{};
+    mutable std::mutex m{};
+    std::condition_variable c{};
+};
+
+auto main() -> int {
+    auto log = spdlog::basic_logger_mt("file_log", "logs/file-log.txt", true);
+    auto queue = blocking_queue<std::vector<task>>{};
+
+    auto polling_work = [finished = false, log, &queue] (task_mainteriner&& maintainer) mutable -> void
+    {
+        maintainer.tasks_ = ranges::views::iota(1, 50)
+                                | ranges::views::transform([](auto i) {
+                                    return task {std::to_string(i) + " : task id", i };
+                                  })
+                                | ranges::to<std::vector>();
+        auto b = 0;
         while (not finished)
         {
             auto next_execution_time = std::chrono::steady_clock::now() + std::chrono::milliseconds{50};
 
-            // Check if we can start any tasks
-            ranges::for_each(mainteriner.tasks_, [](auto const& task) {
-                spdlog::info("name {}", task.name_);
+            for(auto const& ts : maintainer.tasks_)
+            {
+                if (ts.i == 349) finished = true;
                 std::this_thread::sleep_for(std::chrono::microseconds{50});
-            });
+            }
 
-            // if we can start a task launch it ("fire the missles" - ltesta)
-            task meets_requirements{};
-            ex::sender auto task_work = ex::just(task{meets_requirements}) | ex::then([](task&& t){t.run(t);});
+            log->info("queueing tasks to work thread for the {} time", ++b);
+            queue.enqueue
+            (
+                maintainer.tasks_
+                | ranges::views::filter([](task const& t){return t.i % 2 == 0;})
+                | ranges::to<std::vector>()
+            );
 
-            // zmq.send(task_work)
+            for(auto& ts : maintainer.tasks_) ts.i += 100;
+
+
             std::this_thread::sleep_until(next_execution_time);
         }
     };
 
-    auto poller =
-        ex::just(task_mainteriner{})
-        | ex::then(polling_work);
-
-    // execute the whole flow asynchronously
-    ex::start_detached(std::move(poller));
-
-    auto work_manager = [/* zmq */]{
+    auto work_manager = [log, &queue]
+    {
         auto work_pool      = exec::static_thread_pool{32};
         auto work_scheduler = work_pool.get_scheduler();
+        auto finished       = false;
+        auto i = 1, b = 0;
+        exec::async_scope scope;
 
+        while (not finished)
+        {
+            if (b++ == 3) finished = true;
+            auto tasks = queue.dequeue();
+            for (auto const& t : tasks)
+                scope.spawn(ex::on(work_scheduler,
+                    ex::just(t, i++)
+                     | ex::then([log](task const& xt, int xi) {
+                         log->info("working on task={} async id={}", xt.i, xi);
+                     }))
+                );
+            log->info("launching tasks for {} time", b);
+        }
 
-
+        (void) stdexec::sync_wait(scope.on_empty());
+        log->info("finished all tasks");
     };
 
-
-    // exec::async_scope scope;
-    //
-    //
-    //
-    //
-    // scope.spawn(std::move(snd));
-    //
-    // (void) stdexec::sync_wait(scope.on_empty());
+    auto work_pool      = exec::static_thread_pool{2};
+    auto work_scheduler = work_pool.get_scheduler();
+    exec::async_scope scope;
+    scope.spawn(ex::on(work_scheduler,ex::just() | ex::then(work_manager)));
+    scope.spawn(ex::on(work_scheduler,ex::just(task_mainteriner{}) | ex::then(polling_work)));
+    (void) stdexec::sync_wait(scope.on_empty());
     return 0;
 }
