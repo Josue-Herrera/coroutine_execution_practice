@@ -60,7 +60,7 @@ struct task {
     void write_to_file(){}
 };
 
-struct task_mainteriner {
+struct task_maintainer {
     std::vector<task> tasks_;
 };
 
@@ -88,74 +88,106 @@ private:
     std::condition_variable c{};
 };
 
-auto main() -> int {
-    auto log = spdlog::basic_logger_mt("file_log", "logs/file-log.txt", true);
-    auto queue = blocking_queue<std::vector<task>>{};
+struct poll_parameters {
+    std::shared_ptr<spdlog::logger> log;
+    std::shared_ptr<blocking_queue<std::vector<task>>> queue;
+    task_maintainer maintainer{};
+    bool finished = false;
+};
+auto polling_work (poll_parameters&& params) -> void
+{
+    auto&& [log, queue, maintainer, finished] = std::forward<poll_parameters>(params);
 
-    auto polling_work = [finished = false, log, &queue] (task_mainteriner&& maintainer) mutable -> void
+    maintainer.tasks_ = ranges::views::iota(1, 50)
+                            | ranges::views::transform([](auto i){ return task {std::to_string(i) + " : task id", i }; })
+                            | ranges::to<std::vector>();
+    auto b = 0;
+    while (not finished)
     {
-        maintainer.tasks_ = ranges::views::iota(1, 50)
-                                | ranges::views::transform([](auto i) {
-                                    return task {std::to_string(i) + " : task id", i };
-                                  })
-                                | ranges::to<std::vector>();
-        auto b = 0;
-        while (not finished)
+        auto next_execution_time = std::chrono::steady_clock::now() + std::chrono::milliseconds{50};
+
+        for(auto const& ts : maintainer.tasks_)
         {
-            auto next_execution_time = std::chrono::steady_clock::now() + std::chrono::milliseconds{50};
-
-            for(auto const& ts : maintainer.tasks_)
-            {
-                if (ts.i == 349) finished = true;
-                std::this_thread::sleep_for(std::chrono::microseconds{50});
-            }
-
-            log->info("queueing tasks to work thread for the {} time", ++b);
-            queue.enqueue
-            (
-                maintainer.tasks_
-                | ranges::views::filter([](task const& t){return t.i % 2 == 0;})
-                | ranges::to<std::vector>()
-            );
-
-            for(auto& ts : maintainer.tasks_) ts.i += 100;
-
-
-            std::this_thread::sleep_until(next_execution_time);
-        }
-    };
-
-    auto work_manager = [log, &queue]
-    {
-        auto work_pool      = exec::static_thread_pool{32};
-        auto work_scheduler = work_pool.get_scheduler();
-        auto finished       = false;
-        auto i = 1, b = 0;
-        exec::async_scope scope;
-
-        while (not finished)
-        {
-            if (b++ == 3) finished = true;
-            auto tasks = queue.dequeue();
-            for (auto const& t : tasks)
-                scope.spawn(ex::on(work_scheduler,
-                    ex::just(t, i++)
-                     | ex::then([log](task const& xt, int xi) {
-                         log->info("working on task={} async id={}", xt.i, xi);
-                     }))
-                );
-            log->info("launching tasks for {} time", b);
+            if (ts.i == 349) finished = true;
+            std::this_thread::sleep_for(std::chrono::microseconds{50});
         }
 
-        (void) stdexec::sync_wait(scope.on_empty());
-        log->info("finished all tasks");
-    };
+        log->info("[poller] queueing tasks to work thread for the {} time", ++b);
+        queue->enqueue
+        (
+            maintainer.tasks_
+            | ranges::views::filter([](task const& t){return t.i % 2 == 0;})
+            | ranges::to<std::vector>()
+        );
 
-    auto work_pool      = exec::static_thread_pool{2};
+        for(auto& ts : maintainer.tasks_) ts.i += 100;
+
+
+        std::this_thread::sleep_until(next_execution_time);
+    }
+};
+
+struct worker_parameters {
+    std::shared_ptr<spdlog::logger> log;
+    std::shared_ptr<blocking_queue<std::vector<task>>> queue;
+    bool finished = false;
+    int i = 1, b = 0;
+};
+
+auto work_manager (worker_parameters&& parameters) -> void
+{
+    auto [log, queue, finished, i, b ] = parameters;
+    exec::static_thread_pool work_pool{32};
     auto work_scheduler = work_pool.get_scheduler();
     exec::async_scope scope;
-    scope.spawn(ex::on(work_scheduler,ex::just() | ex::then(work_manager)));
-    scope.spawn(ex::on(work_scheduler,ex::just(task_mainteriner{}) | ex::then(polling_work)));
+
+    while (not finished)
+    {
+        if (b++ == 3) finished = true;
+        log->info("[manager] waiting for tasks");
+        auto const tasks = queue->dequeue();
+        log->info("[manager] recieved {} tasks", std::size(tasks));
+
+        for (auto const& t : tasks)
+            scope.spawn(ex::on(work_scheduler,
+                ex::just(t, i++)
+                 | ex::then([log](task const& xt, int xi) {
+                     log->info("[worker:{}] working on task={}",xi, xt.i);
+                     std::this_thread::sleep_for(std::chrono::microseconds{50});
+                 }))
+            );
+        log->info("[manager] launching tasks for {} time", b);
+    }
+
     (void) stdexec::sync_wait(scope.on_empty());
+    log->info("[manager] finished all tasks");
+};
+
+
+
+
+auto main() -> int {
+    auto file_logger = spdlog::basic_logger_mt("file_log", "logs/file-log.txt", true);
+    auto task_queue     = std::make_shared<blocking_queue<std::vector<task>>>();
+    auto work_pool      = exec::static_thread_pool{2};
+    auto work_scheduler = work_pool.get_scheduler();
+    auto scope          = exec::async_scope{};
+
+    scope.spawn(
+    ex::on(work_scheduler,
+            ex::just(worker_parameters{file_logger, task_queue} )
+            | ex::then(work_manager)
+        )
+    );
+
+    scope.spawn(
+        ex::on(work_scheduler,
+            ex::just(poll_parameters{file_logger, task_queue})
+            | ex::then(polling_work)
+        )
+    );
+
+    (void) stdexec::sync_wait(scope.on_empty());
+    work_pool.request_stop();
     return 0;
 }
