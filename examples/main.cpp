@@ -66,17 +66,17 @@ struct task_maintainer {
 
 template <class T> struct blocking_queue
 {
-    constexpr void enqueue(T&& t) noexcept
+    constexpr auto enqueue(T&& t) noexcept -> void
     {
         std::lock_guard<std::mutex> lock(m);
         q.push(std::forward<T>(t));
         c.notify_one();
     }
 
-    [[nodiscard]] constexpr T dequeue() noexcept
+    [[nodiscard]] constexpr auto dequeue() noexcept -> T
     {
         std::unique_lock<std::mutex> lock(m);
-        while(q.empty()) { c.wait(lock); }
+        while(q.empty()) c.wait(lock);
         T val = std::move(q.front());
         q.pop();
         return val;
@@ -99,12 +99,12 @@ auto polling_work (poll_parameters&& params) -> void
     auto&& [log, queue, maintainer, finished] = std::forward<poll_parameters>(params);
 
     maintainer.tasks_ = ranges::views::iota(1, 50)
-                            | ranges::views::transform([](auto i){ return task {std::to_string(i) + " : task id", i }; })
-                            | ranges::to<std::vector>();
+                        | ranges::views::transform([](auto i){ return task {std::to_string(i) + " : task id", i }; })
+                        | ranges::to<std::vector>();
     auto b = 0;
     while (not finished)
     {
-        auto next_execution_time = std::chrono::steady_clock::now() + std::chrono::milliseconds{50};
+        auto const next_execution_time = std::chrono::steady_clock::now() + std::chrono::milliseconds{50};
 
         for(auto const& ts : maintainer.tasks_)
         {
@@ -115,6 +115,7 @@ auto polling_work (poll_parameters&& params) -> void
         log->info("[poller] queueing tasks to work thread for the {} time", ++b);
         queue->enqueue
         (
+            // we are find the available tasks to run and sending them to work manager thread
             maintainer.tasks_
             | ranges::views::filter([](task const& t){return t.i % 2 == 0;})
             | ranges::to<std::vector>()
@@ -136,7 +137,8 @@ struct worker_parameters {
 
 auto work_manager (worker_parameters&& parameters) -> void
 {
-    auto [log, queue, finished, i, b ] = parameters;
+    auto&& [log, queue, finished, i, b ] = std::forward<worker_parameters>(parameters);
+
     exec::static_thread_pool work_pool{32};
     auto work_scheduler = work_pool.get_scheduler();
     exec::async_scope scope;
@@ -146,7 +148,7 @@ auto work_manager (worker_parameters&& parameters) -> void
         if (b++ == 3) finished = true;
         log->info("[manager] waiting for tasks");
         auto const tasks = queue->dequeue();
-        log->info("[manager] recieved {} tasks", std::size(tasks));
+        log->info("[manager] received {} tasks", std::size(tasks));
 
         for (auto const& t : tasks)
             scope.spawn(ex::on(work_scheduler,
@@ -163,27 +165,48 @@ auto work_manager (worker_parameters&& parameters) -> void
     log->info("[manager] finished all tasks");
 };
 
-
-
-
-auto main() -> int {
-    auto file_logger = spdlog::basic_logger_mt("file_log", "logs/file-log.txt", true);
-    auto task_queue     = std::make_shared<blocking_queue<std::vector<task>>>();
-    auto work_pool      = exec::static_thread_pool{2};
-    auto work_scheduler = work_pool.get_scheduler();
-    auto scope          = exec::async_scope{};
-
-    scope.spawn(
-    ex::on(work_scheduler,
+/**
+ * purpose:
+ *     1. waits for tasks in queue
+ *     2. spawns processes in thread_pool
+ *     3. wait for all tasks to finish
+ *     --- 4. accumulate results of process
+ */
+auto work_sender (ex::scheduler auto& work_scheduler, auto file_logger, auto task_queue)
+{
+    return ex::on(work_scheduler,
             ex::just(worker_parameters{file_logger, task_queue} )
             | ex::then(work_manager)
-        )
     );
+}
+
+// coroutine
+auto zmq() { };
+
+auto main() -> int {
+    auto file_logger    = spdlog::basic_logger_mt("file_log", "logs/file-log.txt", true);
+    auto task_queue     = std::make_shared<blocking_queue<std::vector<task>>>();
+//  auto io_queue       = std::make_shared<blocking_queue<std::vector<task>>>();
+    auto work_pool      = exec::static_thread_pool{3};
+    auto work_scheduler = work_pool.get_scheduler();
+    auto scope          = exec::async_scope{};
+//1. auto dependency_map = concurrent_map<string, dags>{}
+//2. auto task_maintainer = concurrent_task_maintainer{};
+
+    scope.spawn(work_sender(work_scheduler, file_logger, task_queue));
+
 
     scope.spawn(
         ex::on(work_scheduler,
             ex::just(poll_parameters{file_logger, task_queue})
             | ex::then(polling_work)
+        )
+    );
+
+    scope.spawn(
+         ex::on(work_scheduler,
+            ex::just()
+            | ex::then([]{zmq();})
         )
     );
 
