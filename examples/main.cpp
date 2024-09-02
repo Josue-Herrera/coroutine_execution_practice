@@ -141,33 +141,12 @@ struct worker_parameters {
 
 struct task_result_type { };
 
-auto parallel_for_each(ranges::range auto&& range, auto lambda) {
-    return std::for_each(std::execution::par, std::begin(range), std::end(range), lambda);
-}
 
 auto process_task(task const&) -> task_result_type { return {}; }
 
-[[nodiscard]] auto parallel_for_each(ranges::range auto const& in, auto function) {
-    using value_type = ranges::range_value_t<decltype(in)>;
-    using result_type = std::invoke_result_t<decltype(function), value_type>;
-
-    std::vector<result_type> results(std::size(in));
-
-    const auto result_indices = ranges::views::iota(std::size_t{0}, std::size(in));
-
-    std::for_each(std::execution::par, std::begin(result_indices), std::end(result_indices),
-    [&] (std::size_t index) {
-        results[index] = function(in[index]);
-    });
-
-    return results;
-}
 auto work_manager (worker_parameters&& parameters) -> void
 {
     auto&& [log, queue, finished, i, b ] = std::forward<worker_parameters>(parameters);
-
-    auto const tasks1 = queue->dequeue();
-    const auto results = parallel_for_each(tasks1, process_task);
 
     exec::static_thread_pool work_pool{32};
     auto work_scheduler = work_pool.get_scheduler();
@@ -175,7 +154,7 @@ auto work_manager (worker_parameters&& parameters) -> void
 
     while (not finished)
     {
-        if (b++ == 2) finished = true;
+        if (b++ == 3) finished = true;
         log->info("[manager] waiting for tasks");
         auto const tasks = queue->dequeue();
         // alert the user => task in progress
@@ -213,7 +192,7 @@ auto work_sender (ex::scheduler auto& work_scheduler, auto file_logger, auto tas
 
 // coroutine
 // support API commands
-struct dag_create {};
+struct dag_create { int id{};};
 struct dag_delete {};
 struct dag_run{};
 struct dag_snapshot {};
@@ -237,7 +216,7 @@ struct command {
         command_error
     >;
 
-    input_commands_t input_command{};
+    input_commands_t command_{};
 };
 
 auto zmq() -> void
@@ -251,25 +230,91 @@ auto zmq() -> void
     //co_return {};
 };
 
+struct command_result_type {};
  class concurrent_shy_guy
 {
 public:
+     /**
+      * @brief Create DAG in a concurrent manner
+      * @param input
+      */
+     auto process_command(dag_create input) noexcept -> command_result_type {
+         std::lock_guard<std::mutex> lock (this->mutex_);
+         log->info("dag info {}", input.id);
+     }
+
+     /**
+      * @brief Delete DAG in a concurrent manner
+      * @param input
+      */
+     auto process_command(dag_delete input) noexcept -> command_result_type {
+         std::lock_guard<std::mutex> lock (this->mutex_);
+         log->info("dag delete");
+     }
+
+     /**
+      * @brief Snapshop DAG in a concurrent manner
+      * @param input
+      */
+     auto process_command(dag_snapshot input) noexcept -> command_result_type {
+         std::lock_guard<std::mutex> lock (this->mutex_);
+         log->info("dag snapshot");
+     }
+
+     /**
+     * @brief Create Task in a concurrent manner
+     * @param input
+     */
+     auto process_command(task_create input) noexcept -> command_result_type {
+         std::lock_guard<std::mutex> lock (this->mutex_);
+         log->info("task create");
+     }
+
+     /**
+     * @brief delete Task in a concurrent manner
+     * @param input
+     */
+     auto process_command(task_delete input) noexcept -> command_result_type {
+         std::lock_guard<std::mutex> lock (this->mutex_);
+         log->info("task create");
+     }
+
+     /**
+     * @brief run Task in a concurrent manner
+     * @param input
+     */
+     auto process_command(task_run input) noexcept -> command_result_type {
+         std::lock_guard<std::mutex> lock (this->mutex_);
+         log->info("task run");
+     }
 
 private:
-    mutable std::mutex m{};
+     mutable std::mutex mutex_{};
+     std::shared_ptr<spdlog::logger> log;
+
+
 };
 
 class notify_updater
 {
 public:
-    constexpr auto notify_update_wakeup() noexcept -> void {
-        std::lock_guard<std::mutex> lock(m);
-        c.notify_one();
+    auto notify_update_wakeup(std::chrono::steady_clock::time_point time) noexcept -> void {
+        std::lock_guard<std::mutex> lock(this->mutex_);
+        cached_time_ = time;
+        this->condition_variable_.notify_one();
     }
 
+    auto sleep_until_or_notified(std::chrono::steady_clock::time_point next_time) noexcept -> void {
+        std::unique_lock<std::mutex> lock {this->mutex_};
+        this->condition_variable_.wait_until(lock, next_time);
+    }
+
+    auto notified_time() const noexcept { return cached_time_; }
+
 private:
-    mutable std::mutex m{};
-    std::condition_variable c{};
+    std::optional<std::chrono::steady_clock::time_point> cached_time_{};
+    mutable std::mutex mutex_{};
+    std::condition_variable condition_variable_{};
 };
 
 
