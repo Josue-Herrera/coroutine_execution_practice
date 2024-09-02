@@ -38,6 +38,7 @@
 #include <chrono>
 #include <mutex>
 #include <queue>
+#include <execution>
 
 // Pull in the reference implementation of P2300:
 #include <range/v3/all.hpp>
@@ -45,10 +46,13 @@
 #include <fmt/ranges.h>
 #include <stdexec/execution.hpp>
 #include <exec/async_scope.hpp>
+#include <exec/task.hpp>
 #include <range/v3/all.hpp>
 // Use a thread pool
 #include "exec/static_thread_pool.hpp"
 #include "spdlog/sinks/basic_file_sink.h"
+
+
 
 namespace ex = stdexec;
 struct task {
@@ -135,9 +139,35 @@ struct worker_parameters {
     int i = 1, b = 0;
 };
 
+struct task_result_type { };
+
+auto parallel_for_each(ranges::range auto&& range, auto lambda) {
+    return std::for_each(std::execution::par, std::begin(range), std::end(range), lambda);
+}
+
+auto process_task(task const&) -> task_result_type { return {}; }
+
+[[nodiscard]] auto parallel_for_each(ranges::range auto const& in, auto function) {
+    using value_type = ranges::range_value_t<decltype(in)>;
+    using result_type = std::invoke_result_t<decltype(function), value_type>;
+
+    std::vector<result_type> results(std::size(in));
+
+    const auto result_indices = ranges::views::iota(std::size_t{0}, std::size(in));
+
+    std::for_each(std::execution::par, std::begin(result_indices), std::end(result_indices),
+    [&] (std::size_t index) {
+        results[index] = function(in[index]);
+    });
+
+    return results;
+}
 auto work_manager (worker_parameters&& parameters) -> void
 {
     auto&& [log, queue, finished, i, b ] = std::forward<worker_parameters>(parameters);
+
+    auto const tasks1 = queue->dequeue();
+    const auto results = parallel_for_each(tasks1, process_task);
 
     exec::static_thread_pool work_pool{32};
     auto work_scheduler = work_pool.get_scheduler();
@@ -145,9 +175,10 @@ auto work_manager (worker_parameters&& parameters) -> void
 
     while (not finished)
     {
-        if (b++ == 3) finished = true;
+        if (b++ == 2) finished = true;
         log->info("[manager] waiting for tasks");
         auto const tasks = queue->dequeue();
+        // alert the user => task in progress
         log->info("[manager] received {} tasks", std::size(tasks));
 
         for (auto const& t : tasks)
@@ -181,9 +212,71 @@ auto work_sender (ex::scheduler auto& work_scheduler, auto file_logger, auto tas
 }
 
 // coroutine
-auto zmq() { };
+// support API commands
+struct dag_create {};
+struct dag_delete {};
+struct dag_run{};
+struct dag_snapshot {};
 
-auto main() -> int {
+struct task_create {};
+struct task_delete {};
+struct task_run {};
+struct command_error{};
+
+struct command {
+    using input_commands_t = std::variant
+    <
+        std::monostate,
+        dag_create,
+        dag_delete,
+        dag_run,
+        dag_snapshot,
+        task_create,
+        task_delete,
+        task_run,
+        command_error
+    >;
+
+    input_commands_t input_command{};
+};
+
+auto zmq() -> void
+{
+    // setup zmq context, sockets, polling.
+    // buffer
+    while (true) {
+        // auto some_data = socket.get(buffer);
+        // co_yeild to_command(some_data);
+    }
+    //co_return {};
+};
+
+ class concurrent_shy_guy
+{
+public:
+
+private:
+    mutable std::mutex m{};
+};
+
+class notify_updater
+{
+public:
+    constexpr auto notify_update_wakeup() noexcept -> void {
+        std::lock_guard<std::mutex> lock(m);
+        c.notify_one();
+    }
+
+private:
+    mutable std::mutex m{};
+    std::condition_variable c{};
+};
+
+
+
+
+auto main() -> int
+{
     auto file_logger    = spdlog::basic_logger_mt("file_log", "logs/file-log.txt", true);
     auto task_queue     = std::make_shared<blocking_queue<std::vector<task>>>();
 //  auto io_queue       = std::make_shared<blocking_queue<std::vector<task>>>();
@@ -193,8 +286,8 @@ auto main() -> int {
 //1. auto dependency_map = concurrent_map<string, dags>{}
 //2. auto task_maintainer = concurrent_task_maintainer{};
 
-    scope.spawn(work_sender(work_scheduler, file_logger, task_queue));
-
+    ex::sender auto worker = work_sender(work_scheduler, file_logger, task_queue);
+    scope.spawn(std::move(worker));
 
     scope.spawn(
         ex::on(work_scheduler,
@@ -206,7 +299,12 @@ auto main() -> int {
     scope.spawn(
          ex::on(work_scheduler,
             ex::just()
-            | ex::then([]{zmq();})
+            | ex::then([] {
+                while (false) {
+                    //auto value = co_await zmq();
+                    //io_queue.enqueue(co_await zmq());
+                }
+            })
         )
     );
 
@@ -214,3 +312,12 @@ auto main() -> int {
     work_pool.request_stop();
     return 0;
 }
+
+
+// for each dag -> have a schedule in which it will sleep and then from there
+// like if dag 1 (every hour) and dag 2 (every 45 mins) starting at 1pm
+// calculate the dag with the minimum difference in time (next closes time) ((dag2) 1:45pm is earlier than (dag1) 2:00pm)
+// api calculate_next_time_to_sleep(vector<tuple<name, schedule, last_time_ran>>, time_now) -> tuple { next_dag_to_run_name,
+// sleep till 1:45 and then start dag 2
+//
+//
