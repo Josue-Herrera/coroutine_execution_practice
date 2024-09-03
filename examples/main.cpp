@@ -193,14 +193,14 @@ auto work_sender (ex::scheduler auto& work_scheduler, auto file_logger, auto tas
 // coroutine
 // support API commands
 struct dag_create { int id{};};
-struct dag_delete {};
-struct dag_run{};
-struct dag_snapshot {};
+struct dag_delete { int id{};};
+struct dag_run{int id{};};
+struct dag_snapshot {int id{};};
 
-struct task_create {};
-struct task_delete {};
-struct task_run {};
-struct command_error{};
+struct task_create {int id{};};
+struct task_delete {int id{};};
+struct task_run {int id{};};
+struct command_error{int id{};};
 
 struct command {
     using input_commands_t = std::variant
@@ -231,6 +231,10 @@ auto zmq() -> void
 };
 
 struct command_result_type {};
+struct notification_type {
+    std::chrono::steady_clock::time_point time;
+    int associated_dag;
+};
  class concurrent_shy_guy
 {
 public:
@@ -241,6 +245,7 @@ public:
      auto process_command(dag_create input) noexcept -> command_result_type {
          std::lock_guard<std::mutex> lock (this->mutex_);
          log->info("dag info {}", input.id);
+         return {};
      }
 
      /**
@@ -249,16 +254,28 @@ public:
       */
      auto process_command(dag_delete input) noexcept -> command_result_type {
          std::lock_guard<std::mutex> lock (this->mutex_);
-         log->info("dag delete");
+         log->info("dag delete  {}", input.id);
+         return {};
      }
 
      /**
       * @brief Snapshop DAG in a concurrent manner
       * @param input
       */
-     auto process_command(dag_snapshot input) noexcept -> command_result_type {
+     auto process_command(dag_snapshot input) const noexcept -> command_result_type {
          std::lock_guard<std::mutex> lock (this->mutex_);
-         log->info("dag snapshot");
+         log->info("dag snapshot {}", input.id);
+         return {};
+     }
+
+     /**
+      * @brief Create DAG in a concurrent manner
+      * @param input
+      */
+     auto process_command(dag_run input) noexcept -> command_result_type {
+         std::lock_guard<std::mutex> lock (this->mutex_);
+         log->info("dag run {}", input.id);
+         return {};
      }
 
      /**
@@ -267,7 +284,8 @@ public:
      */
      auto process_command(task_create input) noexcept -> command_result_type {
          std::lock_guard<std::mutex> lock (this->mutex_);
-         log->info("task create");
+         log->info("task create {}", input.id);
+         return {};
      }
 
      /**
@@ -276,49 +294,106 @@ public:
      */
      auto process_command(task_delete input) noexcept -> command_result_type {
          std::lock_guard<std::mutex> lock (this->mutex_);
-         log->info("task create");
+         log->info("task create {}", input.id);
+         return {};
      }
 
      /**
-     * @brief run Task in a concurrent manner
-     * @param input
-     */
-     auto process_command(task_run input) noexcept -> command_result_type {
+      * @brief run Task in a concurrent manner
+      * @param input copied value to prevent spooky action at a distance
+      */
+     auto process_command(task_run input) const noexcept -> command_result_type {
          std::lock_guard<std::mutex> lock (this->mutex_);
-         log->info("task run");
+         log->info("task run {}", input.id);
+         return {};
      }
 
+     /**
+      * @brief run next scheduled dag
+      *
+      * @return time of the next scheduled dag.
+      */
+     auto next_scheduled_dag() const noexcept -> std::optional<notification_type> {
+         std::lock_guard<std::mutex> lock (this->mutex_);
+         return { notification_type {
+             .time = std::chrono::steady_clock::now() +  std::chrono::seconds{5},
+             .associated_dag = 1
+         }};
+     }
 private:
      mutable std::mutex mutex_{};
      std::shared_ptr<spdlog::logger> log;
-
-
 };
 
 class notify_updater
 {
 public:
-    auto notify_update_wakeup(std::chrono::steady_clock::time_point time) noexcept -> void {
+
+    auto notify_wakeup(notification_type notification) noexcept -> void {
         std::lock_guard<std::mutex> lock(this->mutex_);
-        cached_time_ = time;
+        cached_time_ = notification;
         this->condition_variable_.notify_one();
     }
 
-    auto sleep_until_or_notified(std::chrono::steady_clock::time_point next_time) noexcept -> void {
+    auto sleep_until_or_notified(std::chrono::steady_clock::time_point next_time) noexcept {
         std::unique_lock<std::mutex> lock {this->mutex_};
         this->condition_variable_.wait_until(lock, next_time);
+        auto result_time = cached_time_;
+        cached_time_.reset();
+        return result_time;
     }
 
-    auto notified_time() const noexcept { return cached_time_; }
-
 private:
-    std::optional<std::chrono::steady_clock::time_point> cached_time_{};
+    std::optional<notification_type> cached_time_{};
     mutable std::mutex mutex_{};
     std::condition_variable condition_variable_{};
 };
 
 
+auto function_schedule_runner (notify_updater& notifier, concurrent_shy_guy& shy_guy) {
+    // default sleep time
+    auto sleep_until_dag_scheduled = [&] mutable -> notification_type
+    {
+        auto default_wait_time = std::chrono::steady_clock::now() + std::chrono::months(1);
+            while(true)
+            {
+                if (auto notification  = notifier.sleep_until_or_notified(default_wait_time); notification.has_value())
+                {
+                    return notification.value();
+                }
+                else
+                {
+                    default_wait_time += std::chrono::months(1);
+                }
+            }
+    };
 
+    auto launch_dag_and_sleep_till_next = [&] (auto notified) mutable
+    {
+        while (true)
+        {
+            if (auto notification = notifier.sleep_until_or_notified(notified.time); notification.has_value())
+            {
+                notified = notification.value();
+                continue;
+            }
+
+            shy_guy.process_command(dag_run{notified.associated_dag});
+
+            auto const next_scheduled_time = shy_guy.next_scheduled_dag();
+            if (not next_scheduled_time.has_value())
+                break;
+
+            notified = next_scheduled_time.value();
+        }
+    };
+
+    while (true)
+    {
+        auto const notification = sleep_until_dag_scheduled();
+        launch_dag_and_sleep_till_next(notification);
+    }
+}
 
 auto main() -> int
 {
