@@ -38,7 +38,6 @@
 #include <chrono>
 #include <mutex>
 #include <queue>
-#include <execution>
 
 // Pull in the reference implementation of P2300:
 #include <range/v3/all.hpp>
@@ -51,6 +50,7 @@
 // Use a thread pool
 #include "exec/static_thread_pool.hpp"
 #include "spdlog/sinks/basic_file_sink.h"
+
 
 
 
@@ -205,7 +205,6 @@ struct command_error{int id{};};
 struct command {
     using input_commands_t = std::variant
     <
-        std::monostate,
         dag_create,
         dag_delete,
         dag_run,
@@ -219,16 +218,20 @@ struct command {
     input_commands_t command_{};
 };
 
-auto zmq() -> void
+auto zmq() -> exec::task<command>
 {
     // setup zmq context, sockets, polling.
     // buffer
-    while (true) {
-        // auto some_data = socket.get(buffer);
-        // co_yeild to_command(some_data);
-    }
-    //co_return {};
-};
+    // static constexpr const std::array input_commands = {
+    //    //     command{dag_create{ 1 }},
+    //    //     command{dag_create{ 2 }}
+    //    // };
+    //    // for(auto const& data : input_commands)
+    //    // {
+    //    //     //co_yield data;
+    //    // }
+    co_return {command_error{1}};
+}
 
 struct command_result_type {};
 struct notification_type {
@@ -324,7 +327,6 @@ private:
      mutable std::mutex mutex_{};
      std::shared_ptr<spdlog::logger> log;
 };
-
 class notify_updater
 {
 public:
@@ -349,23 +351,23 @@ private:
     std::condition_variable condition_variable_{};
 };
 
+//auto function_s
 
 auto function_schedule_runner (notify_updater& notifier, concurrent_shy_guy& shy_guy) {
-    // default sleep time
     auto sleep_until_dag_scheduled = [&] mutable -> notification_type
     {
         auto default_wait_time = std::chrono::steady_clock::now() + std::chrono::months(1);
-            while(true)
+        while(true)
+        {
+            if (auto notification  = notifier.sleep_until_or_notified(default_wait_time); notification.has_value())
             {
-                if (auto notification  = notifier.sleep_until_or_notified(default_wait_time); notification.has_value())
-                {
-                    return notification.value();
-                }
-                else
-                {
-                    default_wait_time += std::chrono::months(1);
-                }
+                return notification.value();
             }
+            else
+            {
+                default_wait_time += std::chrono::months(1);
+            }
+        }
     };
 
     auto launch_dag_and_sleep_till_next = [&] (auto notified) mutable
